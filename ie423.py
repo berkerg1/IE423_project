@@ -623,6 +623,56 @@ def match_warnings_to_events(warnings, events, max_lead: int = MAX_LEAD):
 
     return matched_pairs, false_alarms, missed_events
 
+def optimize_parameters(df):
+    """
+    Runs a simple Grid Search to find the best parameters for the Official Score.
+    """
+    print("\nStarting Parameter Optimization (Grid Search)...")
+    
+    # We define a search space for thresholds and cooldowns
+    param_grid = [
+        {"thresh": 3.5, "cool": 8},
+        {"thresh": 4.0, "cool": 8},   # Your previous default
+        {"thresh": 4.0, "cool": 10},
+        {"thresh": 4.5, "cool": 10},
+        {"thresh": 5.0, "cool": 12},
+        {"thresh": 5.0, "cool": 15},
+    ]
+    
+    best_score = -1
+    best_params = None
+    
+    # Use global keywords to modify the configuration for the simulation function
+    global GOAL_THRESHOLD, COOLDOWN
+    
+    # Save original values to restore later
+    orig_thresh = GOAL_THRESHOLD
+    orig_cool = COOLDOWN
+    
+    for params in param_grid:
+        # Set new parameters
+        GOAL_THRESHOLD = params["thresh"]
+        COOLDOWN = params["cool"]
+        
+        # Run Evaluation (Silent run, we just want the score)
+        # We assume df is already loaded and clean
+        _, summary, _, _, _ = evaluate_all_matches(df)
+        
+        current_score = summary["average_score_global"]
+        print(f"  Testing Params: {params} -> Avg Score: {current_score:.4f}")
+        
+        if current_score > best_score:
+            best_score = current_score
+            best_params = params
+            
+    print(f"\nOptimization Complete. Best Score: {best_score:.4f}")
+    print(f"Best Parameters Found: {best_params}")
+    
+    # Set the globals to the best found values for the final run
+    GOAL_THRESHOLD = best_params["thresh"]
+    COOLDOWN = best_params["cool"]
+    
+    return best_params
 
 def evaluate_all_matches(df: pd.DataFrame):
     """
@@ -630,6 +680,9 @@ def evaluate_all_matches(df: pd.DataFrame):
     """
     # Ensure data is clean and diff features are present
     df = add_diff_features(df)
+    
+    # 1. Pre-calculate events for all matches (needed for plotting)
+    all_events_dict = extract_events(df)
     
     per_match_results = []
     cusum_storage = {}
@@ -640,7 +693,6 @@ def evaluate_all_matches(df: pd.DataFrame):
     # Group by match
     for mid, match_df in df.groupby("match_id"):
         # 1. Sort strictly to ensure timeline consistency
-        # The official scorer expects row i to be time step i
         match_df = match_df.sort_values(["halftime", "minute"]).reset_index(drop=True)
         
         # 2. Run your prediction model
@@ -654,8 +706,6 @@ def evaluate_all_matches(df: pd.DataFrame):
         cusum_storage[mid] = cusum_df
 
         # 3. Construct Binary y_true (Ground Truth)
-        # Official definition: Event = (diff_GOALS > 0) OR (diff_REDCARDS > 0)
-        # Combine Home + Away into a single 1D stream
         cols_to_check = [
             "diff_GOALS_home", "diff_GOALS_away", 
             "diff_REDCARDS_home", "diff_REDCARDS_away"
@@ -665,13 +715,7 @@ def evaluate_all_matches(df: pd.DataFrame):
         y_true = is_event.astype(int).to_numpy()
 
         # 4. Construct Binary y_pred (Predictions)
-        # Initialize zero array of same length as match
         y_pred = np.zeros(len(match_df), dtype=int)
-        
-        # Mark 1 where we have warnings
-        # Note: We map warning 'minute' back to rows. 
-        # Since 'match_df' is sorted by minute, we find the matching rows.
-        # (This assumes unique minutes per halftime, which is standard)
         warn_minutes = set(w.minute for w in warnings)
         
         for i, row in match_df.iterrows():
@@ -694,7 +738,8 @@ def evaluate_all_matches(df: pd.DataFrame):
             "avg_score": avg_score,
             "score_details": details,
             "warnings": warnings,
-            "lead_times": [] # Kept for compatibility (empty)
+            "events": all_events_dict.get(mid, []), # <--- Fix: Pass events for plotting
+            "lead_times": [] # Kept for compatibility
         }
         per_match_results.append(result)
         all_scores.append(avg_score)
@@ -708,10 +753,9 @@ def evaluate_all_matches(df: pd.DataFrame):
 
     # Helper DFs for saving
     warnings_df = pd.DataFrame([vars(w) for res in per_match_results for w in res["warnings"]])
-    events_df = pd.DataFrame() # Replaced by binary logic, left empty
+    events_df = pd.DataFrame() 
 
     return per_match_results, overall_summary, cusum_storage, warnings_df, events_df
-
 # ===========================
 # En iyi maçların CUSUM grafiği
 # ===========================
@@ -720,87 +764,93 @@ def plot_best_matches(per_match_results, cusum_storage,
                       top_n: int = TOP_N_PLOTS,
                       output_prefix: str = "cusum_multisignal_v3"):
     """
-    En iyi lead time'a sahip maçları seçip
-    home ATTACKS CUSUM grafiğini çiz.
+    Plots the matches with the HIGHEST Official Score.
     """
-    candidates = []
-    for res in per_match_results:
-        if res["lead_times"]:
-            min_lead = min(res["lead_times"])
-            candidates.append((min_lead, res["match_id"]))
+    # Sort results by avg_score descending
+    sorted_results = sorted(per_match_results, key=lambda x: x["avg_score"], reverse=True)
 
-    candidates.sort(key=lambda x: x[0])
-
-    for rank, (lead, mid) in enumerate(candidates[:top_n], start=1):
+    for i in range(min(top_n, len(sorted_results))):
+        res = sorted_results[i]
+        mid = res["match_id"]
+        score = res["avg_score"]
+        
         df_match = cusum_storage[mid]
-        res = next(r for r in per_match_results if r["match_id"] == mid)
 
         plt.figure(figsize=(10, 5))
+        
+        # Plot CUSUM
         plt.plot(df_match["minute"], df_match["CUSUM_ATTACKS_home"],
-                 label="CUSUM (ATTACKS_home)")
+                 label="CUSUM (Home)", color="blue")
+        plt.plot(df_match["minute"], df_match["CUSUM_ATTACKS_away"],
+                 label="CUSUM (Away)", color="cyan", alpha=0.3, linestyle=":")
 
-        # Uyarılar
+        # Plot Warnings
         first_warn_labeled = False
         for w in res["warnings"]:
-            if w.team == "home":
-                label = "Warning (home)" if not first_warn_labeled else None
-                first_warn_labeled = True
-                plt.axvline(w.minute, linestyle="--", label=label)
+            label = "Warning" if not first_warn_labeled else None
+            first_warn_labeled = True
+            plt.axvline(w.minute, color="purple", linestyle="--", alpha=0.7, label=label)
 
-        # Event'ler
+        # Plot Events
         first_goal_labeled = False
-        first_red_labeled = False
         for e in res["events"]:
-            if e["team"] != "home":
-                continue
             color = "orange" if e["type"] == "GOAL" else "red"
-            if e["type"] == "GOAL":
-                label = "GOAL (home)" if not first_goal_labeled else None
+            label = f"{e['type']} ({e['team']})"
+            # Simple deduplication for legend
+            if e["type"] == "GOAL" and not first_goal_labeled:
                 first_goal_labeled = True
             else:
-                label = "RED (home)" if not first_red_labeled else None
-                first_red_labeled = True
-            plt.axvline(e["minute"], color=color, linestyle="-", label=label)
+                label = None
+                
+            plt.axvline(e["minute"], color=color, linewidth=2, label=label)
 
         plt.xlabel("Minute")
-        plt.ylabel("CUSUM")
-        plt.title(f"Match {mid} - Best lead time {lead} minutes")
-        plt.legend()
-        plt.grid(True)
+        plt.ylabel("CUSUM Score")
+        plt.title(f"Match {mid} | Official Score: {score:.2f}")
+        plt.legend(loc="upper left")
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(f"{output_prefix}_match_{mid}.png")
+        plt.savefig(f"{output_prefix}_match_{mid}_rank_{i+1}.png")
         plt.close()
-
 
 # ===========================
 # MAIN
 # ===========================
 
 def main():
+    # 1. Load Data
     df = load_and_clean_data(DATA_PATH)
+    print(f"Data loaded: {len(df)} rows.")
 
+    # 2. Optimize Parameters (Optional - takes time but improves score)
+    # This will find the best GOAL_THRESHOLD and COOLDOWN
+    optimize_parameters(df)
+
+    # 3. Final Evaluation (Using best parameters)
+    print("\nRunning Final Evaluation with Best Parameters...")
     per_match_results, overall_summary, cusum_storage, warnings_df, events_df = evaluate_all_matches(df)
 
-    # Per-match metrikleri yaz
+    # 4. Print Per-match metrics
     print("\n===== Per-match metrics (Official Scoring) =====")
     for res in per_match_results:
         print(f"\nMatch {res['match_id']}:")
-        print(f"  True Events    : {res['n_true_events']}")
+        print(f"  True Events        : {res['n_true_events']}")
         print(f"  Predicted Warnings : {res['n_predicted_events']}")
-        print(f"  AVG SCORE      : {res['avg_score']:.4f}")
+        print(f"  AVG SCORE          : {res['avg_score']:.4f}")
         print(f"  (Details: {res['score_details']['scores']})")
 
-    # Genel özet
+    # 5. Print Overall Summary
     print("\n===== Overall summary (Official Scoring) =====")
     for k, v in overall_summary.items():
         print(f"{k}: {v}")
 
-    # Sonuç CSV'leri
+    # 6. Save Predictions
     warnings_df.to_csv("predictions_multisignal_v3.csv", index=False)
     print("\nSaved: predictions_multisignal_v3.csv")
 
-    # En iyi maçların CUSUM grafiğini çiz
+    # 7. Plot Best Matches
     plot_best_matches(per_match_results, cusum_storage)
+    print("Saved plots for top matches.")
 
 if __name__ == "__main__":
     main()
