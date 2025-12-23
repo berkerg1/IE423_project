@@ -4,6 +4,101 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 from dataclasses import dataclass
 
+# =========================================================
+# OFFICIAL SCORING FUNCTIONS (Required for Evaluation)
+# =========================================================
+from scipy.optimize import linear_sum_assignment
+
+def score_match_events_emd_assignment(
+    y_true,
+    y_pred,
+    W=10,
+    c_fp=1.0,
+    c_fn=2.0,
+    ignore_first_minutes=20,  
+    return_details=True,
+):
+    """
+    Min-cost assignment scoring for binary event sequences with a time window.
+    """
+    y_true = np.asarray(y_true, dtype=int)
+    y_pred = np.asarray(y_pred, dtype=int)
+    
+    # Official Rule: Ignore first 20 minutes in scoring
+    if ignore_first_minutes and ignore_first_minutes > 0:
+        k = min(int(ignore_first_minutes), y_true.shape[0])
+        y_true = y_true.copy()
+        y_pred = y_pred.copy()
+        y_true[:k] = 0
+        y_pred[:k] = 0
+
+    T_indices = np.flatnonzero(y_true == 1) + 1
+    P_indices = np.flatnonzero(y_pred == 1) + 1
+    m, n = len(T_indices), len(P_indices)
+
+    if m == 0 and n == 0:
+        return (100.0, {}) if return_details else 100.0
+
+    INF = 1e9
+    size = m + n
+    C = np.full((size, size), INF, dtype=float)
+
+    if m > 0 and n > 0:
+        dt = np.abs(T_indices[:, None] - P_indices[None, :])
+        allowed = dt <= W
+        timing_cost = dt / float(W)
+        C[:m, :n] = np.where(allowed, timing_cost, INF)
+
+    for i in range(m): C[i, n + i] = c_fn
+    for j in range(n): C[m + j, j] = c_fp
+    C[m:, n:] = 0.0
+
+    row_ind, col_ind = linear_sum_assignment(C)
+    total_cost = float(C[row_ind, col_ind].sum())
+
+    C_max = c_fn * m + c_fp * n
+    score = 100.0 * max(0.0, 1.0 - total_cost / C_max) if C_max > 0 else (100.0 if total_cost == 0 else 0.0)
+
+    if return_details:
+        return score, {"total_cost": total_cost, "C_max": C_max}
+    return score
+
+def score_match_events_multiW_avg(
+    y_true,
+    y_pred,
+    W_values=(10, 15, 20, 25),
+    c_fp=1.0,
+    c_fn=2.0,
+    return_details=True,
+):
+    """
+    Calculates the average score across multiple window sizes (10, 15, 20, 25).
+    """
+    scores = []
+    per_W = {}
+
+    for W in W_values:
+        s, det = score_match_events_emd_assignment(
+            y_true=y_true,
+            y_pred=y_pred,
+            W=W,
+            c_fp=c_fp,
+            c_fn=c_fn,
+            return_details=True,   
+        )
+        scores.append(float(s))
+        per_W[W] = det | {"score": float(s)}  
+
+    avg_score = float(np.mean(scores)) if scores else 0.0
+
+    if return_details:
+        details = {
+            "avg_score": avg_score,
+            "W_values": tuple(W_values),
+            "scores": {W: per_W[W]["score"] for W in W_values},
+        }
+        return avg_score, details
+    return avg_score
 
 # ======================================
 # CONFIG – v3 parametreleri
@@ -531,28 +626,24 @@ def match_warnings_to_events(warnings, events, max_lead: int = MAX_LEAD):
 
 def evaluate_all_matches(df: pd.DataFrame):
     """
-    Tüm maçlar için:
-      - multi-signal model ile uyarı üret
-      - event'leri çıkar
-      - per-match metrik + overall metrik hesapla
-      - her maçın CUSUM grafiği için df'leri sakla
+    Revised evaluation using the OFFICIAL multi-window assignment scoring.
     """
+    # Ensure data is clean and diff features are present
     df = add_diff_features(df)
-    events_by_match = extract_events(df)
-
+    
     per_match_results = []
     cusum_storage = {}
-    all_warnings_global = []
-    all_events_global = []
-
-    total_events = 0
-    total_warnings = 0
-    total_true = 0
-    total_false = 0
-    total_missed = 0
-    all_lead_times = []
-
+    
+    # Accumulators for overall average
+    all_scores = []
+    
+    # Group by match
     for mid, match_df in df.groupby("match_id"):
+        # 1. Sort strictly to ensure timeline consistency
+        # The official scorer expects row i to be time step i
+        match_df = match_df.sort_values(["halftime", "minute"]).reset_index(drop=True)
+        
+        # 2. Run your prediction model
         warnings, cusum_df = simulate_match_multisignal(
             match_df, match_id=mid,
             goal_threshold=GOAL_THRESHOLD,
@@ -562,60 +653,64 @@ def evaluate_all_matches(df: pd.DataFrame):
         )
         cusum_storage[mid] = cusum_df
 
-        events = events_by_match.get(mid, [])
+        # 3. Construct Binary y_true (Ground Truth)
+        # Official definition: Event = (diff_GOALS > 0) OR (diff_REDCARDS > 0)
+        # Combine Home + Away into a single 1D stream
+        cols_to_check = [
+            "diff_GOALS_home", "diff_GOALS_away", 
+            "diff_REDCARDS_home", "diff_REDCARDS_away"
+        ]
+        # Check if any event column > 0 for this row
+        is_event = (match_df[cols_to_check] > 0).any(axis=1)
+        y_true = is_event.astype(int).to_numpy()
 
-        matched_pairs, false_alarms, missed_events = match_warnings_to_events(
-            warnings, events, max_lead=MAX_LEAD
+        # 4. Construct Binary y_pred (Predictions)
+        # Initialize zero array of same length as match
+        y_pred = np.zeros(len(match_df), dtype=int)
+        
+        # Mark 1 where we have warnings
+        # Note: We map warning 'minute' back to rows. 
+        # Since 'match_df' is sorted by minute, we find the matching rows.
+        # (This assumes unique minutes per halftime, which is standard)
+        warn_minutes = set(w.minute for w in warnings)
+        
+        for i, row in match_df.iterrows():
+            if int(row["minute"]) in warn_minutes:
+                y_pred[i] = 1
+
+        # 5. Calculate Official Score
+        avg_score, details = score_match_events_multiW_avg(
+            y_true=y_true,
+            y_pred=y_pred,
+            W_values=(10, 15, 20, 25), # Official Windows
+            c_fp=1.0, 
+            c_fn=2.0
         )
-
-        lead_times = [p["lead_time"] for p in matched_pairs]
 
         result = {
             "match_id": mid,
-            "n_events": len(events),
-            "n_warnings": len(warnings),
-            "true_detections": len(matched_pairs),
-            "false_alarms": false_alarms,
-            "missed_events": missed_events,
-            "lead_times": lead_times,
+            "n_true_events": int(y_true.sum()),
+            "n_predicted_events": int(y_pred.sum()),
+            "avg_score": avg_score,
+            "score_details": details,
             "warnings": warnings,
-            "events": events,
-            "matched_pairs": matched_pairs,
+            "lead_times": [] # Kept for compatibility (empty)
         }
         per_match_results.append(result)
+        all_scores.append(avg_score)
 
-        total_events += len(events)
-        total_warnings += len(warnings)
-        total_true += len(matched_pairs)
-        total_false += false_alarms
-        total_missed += missed_events
-        all_lead_times.extend(lead_times)
-
-        all_warnings_global.extend(
-            [{"match_id": w.match_id, "minute": w.minute, "team": w.team, "score": w.score}
-             for w in warnings]
-        )
-        all_events_global.extend(
-            [{"match_id": mid, "minute": e["minute"], "team": e["team"], "type": e["type"]}
-             for e in events]
-        )
-
+    # 6. Overall Summary
     overall_summary = {
         "total_matches": len(per_match_results),
-        "total_events": total_events,
-        "total_warnings": total_warnings,
-        "total_true_detections": total_true,
-        "total_false_alarms": total_false,
-        "total_missed_events": total_missed,
-        "average_lead_time": float(np.mean(all_lead_times)) if all_lead_times else float("nan"),
-        "median_lead_time": float(np.median(all_lead_times)) if all_lead_times else float("nan"),
+        "average_score_global": float(np.mean(all_scores)) if all_scores else 0.0,
+        "median_score_global": float(np.median(all_scores)) if all_scores else 0.0,
     }
 
-    warnings_df = pd.DataFrame(all_warnings_global)
-    events_df = pd.DataFrame(all_events_global)
+    # Helper DFs for saving
+    warnings_df = pd.DataFrame([vars(w) for res in per_match_results for w in res["warnings"]])
+    events_df = pd.DataFrame() # Replaced by binary logic, left empty
 
     return per_match_results, overall_summary, cusum_storage, warnings_df, events_df
-
 
 # ===========================
 # En iyi maçların CUSUM grafiği
@@ -687,35 +782,25 @@ def main():
     per_match_results, overall_summary, cusum_storage, warnings_df, events_df = evaluate_all_matches(df)
 
     # Per-match metrikleri yaz
-    print("\n===== Per-match metrics (v3) =====")
+    print("\n===== Per-match metrics (Official Scoring) =====")
     for res in per_match_results:
         print(f"\nMatch {res['match_id']}:")
-        print(f"  Events         : {res['n_events']}")
-        print(f"  Warnings       : {res['n_warnings']}")
-        print(f"  True detections: {res['true_detections']}")
-        print(f"  False alarms   : {res['false_alarms']}")
-        print(f"  Missed events  : {res['missed_events']}")
-        print(f"  Lead times     : {res['lead_times']}")
-        if res["matched_pairs"]:
-            print("  Matched (W -> E, team, type, lead, score):")
-            for p in res["matched_pairs"]:
-                print(f"    {p['warning_minute']:2d} -> {p['event_minute']:2d}  "
-                      f"({p['team']}, {p['event_type']}), "
-                      f"lead={p['lead_time']} min, score={p['score']:.2f}")
+        print(f"  True Events    : {res['n_true_events']}")
+        print(f"  Predicted Warnings : {res['n_predicted_events']}")
+        print(f"  AVG SCORE      : {res['avg_score']:.4f}")
+        print(f"  (Details: {res['score_details']['scores']})")
 
     # Genel özet
-    print("\n===== Overall summary (v3) =====")
+    print("\n===== Overall summary (Official Scoring) =====")
     for k, v in overall_summary.items():
         print(f"{k}: {v}")
 
     # Sonuç CSV'leri
     warnings_df.to_csv("predictions_multisignal_v3.csv", index=False)
-    events_df.to_csv("actual_events_from_cumulatives_v3.csv", index=False)
-    print("\nSaved: predictions_multisignal_v3.csv, actual_events_from_cumulatives_v3.csv")
+    print("\nSaved: predictions_multisignal_v3.csv")
 
     # En iyi maçların CUSUM grafiğini çiz
     plot_best_matches(per_match_results, cusum_storage)
-
 
 if __name__ == "__main__":
     main()
